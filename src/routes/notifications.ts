@@ -16,7 +16,16 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
 
     const { limit = '50', offset = '0', unread_only = 'false' } = req.query;
 
-    let query = supabase
+    // Use admin client to bypass RLS, but filter by user_id for security
+    // This ensures we can fetch notifications even if RLS policies have issues
+    if (!supabaseAdmin) {
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        details: 'Service role key not configured'
+      });
+    }
+
+    let query = supabaseAdmin
       .from('notifications')
       .select('*')
       .eq('user_id', req.user.id)
@@ -31,6 +40,7 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
     const { data: notifications, error } = await query;
 
     if (error) {
+      console.error('[GET /notifications] Error fetching notifications:', error);
       return res.status(400).json({ error: error.message });
     }
 
@@ -39,6 +49,7 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
       count: notifications?.length || 0,
     });
   } catch (error) {
+    console.error('[GET /notifications] Unexpected error:', error);
     res.status(500).json({
       error: 'Failed to fetch notifications',
       details: error instanceof Error ? error.message : 'Unknown error',
@@ -56,7 +67,15 @@ router.get('/unread-count', authenticate, async (req: AuthenticatedRequest, res:
       return res.status(401).json({ error: 'Not authenticated' });
     }
 
-    const { data, error, count } = await supabase
+    // Use admin client to bypass RLS, but filter by user_id for security
+    if (!supabaseAdmin) {
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        details: 'Service role key not configured'
+      });
+    }
+
+    const { data, error, count } = await supabaseAdmin
       .from('notifications')
       .select('*', { count: 'exact', head: true })
       .eq('user_id', req.user.id)
@@ -89,8 +108,16 @@ router.put('/:id/read', authenticate, async (req: AuthenticatedRequest, res: Res
 
     const { id } = req.params;
 
+    // Use admin client to bypass RLS, but filter by user_id for security
+    if (!supabaseAdmin) {
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        details: 'Service role key not configured'
+      });
+    }
+
     // First verify the notification belongs to the user
-    const { data: notification, error: fetchError } = await supabase
+    const { data: notification, error: fetchError } = await supabaseAdmin
       .from('notifications')
       .select('*')
       .eq('id', id)
@@ -102,7 +129,7 @@ router.put('/:id/read', authenticate, async (req: AuthenticatedRequest, res: Res
     }
 
     // Update the notification
-    const { data: updatedNotification, error: updateError } = await supabase
+    const { data: updatedNotification, error: updateError } = await supabaseAdmin
       .from('notifications')
       .update({ read: true })
       .eq('id', id)
@@ -138,8 +165,16 @@ router.delete('/:id', authenticate, async (req: AuthenticatedRequest, res: Respo
 
     const { id } = req.params;
 
+    // Use admin client to bypass RLS, but filter by user_id for security
+    if (!supabaseAdmin) {
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        details: 'Service role key not configured'
+      });
+    }
+
     // Verify the notification belongs to the user before deleting
-    const { data: notification, error: fetchError } = await supabase
+    const { data: notification, error: fetchError } = await supabaseAdmin
       .from('notifications')
       .select('*')
       .eq('id', id)
@@ -150,7 +185,7 @@ router.delete('/:id', authenticate, async (req: AuthenticatedRequest, res: Respo
       return res.status(404).json({ error: 'Notification not found' });
     }
 
-    const { error } = await supabase
+    const { error } = await supabaseAdmin
       .from('notifications')
       .delete()
       .eq('id', id)
@@ -242,8 +277,11 @@ router.post('/notify-admin-ready', authenticate, async (req: AuthenticatedReques
       return res.status(400).json({ error: 'order_id is required' });
     }
 
+    console.log(`[NOTIFY-ADMIN] Viewer ${req.user.id} requesting to notify admins about order ${order_id}`);
+
     // Use admin client to bypass RLS
     if (!supabaseAdmin) {
+      console.error('[NOTIFY-ADMIN] Service role key not configured');
       return res.status(500).json({ 
         error: 'Server configuration error',
         details: 'Service role key not configured'
@@ -258,23 +296,33 @@ router.post('/notify-admin-ready', authenticate, async (req: AuthenticatedReques
       .single();
 
     if (orderError || !order) {
+      console.error('[NOTIFY-ADMIN] Order not found:', orderError?.message);
       return res.status(404).json({ error: 'Order not found' });
     }
+
+    console.log(`[NOTIFY-ADMIN] Order found: ${order.customer_name}`);
 
     // Get all admin users
     const { data: adminUsers, error: adminError } = await supabaseAdmin
       .from('user_profiles')
-      .select('id')
+      .select('id, username, role')
       .eq('role', 'admin');
 
     if (adminError) {
+      console.error('[NOTIFY-ADMIN] Failed to fetch admin users:', adminError.message);
       return res.status(500).json({ 
         error: 'Failed to fetch admin users',
         details: adminError.message 
       });
     }
 
+    console.log(`[NOTIFY-ADMIN] Found ${adminUsers?.length || 0} admin user(s)`);
+    if (adminUsers && adminUsers.length > 0) {
+      console.log('[NOTIFY-ADMIN] Admin IDs:', adminUsers.map(u => u.id).join(', '));
+    }
+
     if (!adminUsers || adminUsers.length === 0) {
+      console.warn('[NOTIFY-ADMIN] No admin users found in database');
       return res.status(404).json({ error: 'No admin users found' });
     }
 
@@ -287,17 +335,22 @@ router.post('/notify-admin-ready', authenticate, async (req: AuthenticatedReques
       order_id: order_id,
     }));
 
+    console.log(`[NOTIFY-ADMIN] Creating ${notifications.length} notification(s)...`);
+
     const { data: createdNotifications, error: insertError } = await supabaseAdmin
       .from('notifications')
       .insert(notifications)
       .select();
 
     if (insertError) {
+      console.error('[NOTIFY-ADMIN] Failed to create notifications:', insertError.message);
       return res.status(400).json({ 
         error: 'Failed to create notifications',
         details: insertError.message 
       });
     }
+
+    console.log(`[NOTIFY-ADMIN] Successfully created ${createdNotifications?.length || 0} notification(s)`);
 
     res.status(201).json({
       message: `Notifications sent to ${adminUsers.length} admin(s)`,
@@ -305,6 +358,7 @@ router.post('/notify-admin-ready', authenticate, async (req: AuthenticatedReques
       count: createdNotifications?.length || 0,
     });
   } catch (error) {
+    console.error('[NOTIFY-ADMIN] Unexpected error:', error);
     res.status(500).json({
       error: 'Failed to notify admins',
       details: error instanceof Error ? error.message : 'Unknown error',
