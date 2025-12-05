@@ -6,6 +6,7 @@ import authRoutes from './routes/auth.js';
 import orderRoutes from './routes/orders.js';
 import historyRoutes from './routes/history.js';
 import uploadRoutes from './routes/upload.js';
+import notificationRoutes from './routes/notifications.js';
 
 dotenv.config();
 
@@ -27,6 +28,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/history', historyRoutes);
 app.use('/api/upload', uploadRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // Health check endpoint
 app.get('/health', (req, res) => {

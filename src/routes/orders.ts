@@ -6,6 +6,53 @@ import type { OrderInsert, OrderUpdate } from '../types/database.js';
 const router = Router();
 
 /**
+ * Helper function to create notifications for all admin users
+ */
+async function createNotificationForAdmins(
+  title: string,
+  message: string,
+  type: 'info' | 'success' | 'warning' | 'error' | 'order' = 'order',
+  orderId?: string
+): Promise<void> {
+  if (!supabaseAdmin) {
+    console.warn('Cannot create notifications: Service role key not configured');
+    return;
+  }
+
+  try {
+    // Get all admin users
+    const { data: admins, error: adminError } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id')
+      .eq('role', 'admin');
+
+    if (adminError || !admins || admins.length === 0) {
+      console.warn('No admin users found or error fetching admins:', adminError);
+      return;
+    }
+
+    // Create notifications for all admins
+    const notifications = admins.map(admin => ({
+      user_id: admin.id,
+      title,
+      message,
+      type,
+      order_id: orderId || null,
+    }));
+
+    const { error: notificationError } = await supabaseAdmin
+      .from('notifications')
+      .insert(notifications);
+
+    if (notificationError) {
+      console.error('Failed to create notifications:', notificationError);
+    }
+  } catch (error) {
+    console.error('Error creating notifications for admins:', error);
+  }
+}
+
+/**
  * GET /api/orders
  * Get all orders (requires authentication)
  */
@@ -118,6 +165,16 @@ router.post('/', authenticate, requireAdmin, async (req: AuthenticatedRequest, r
       return res.status(400).json({ error: error.message });
     }
 
+    // Create notification for admins (excluding the creator if they're an admin)
+    if (order) {
+      await createNotificationForAdmins(
+        'New Order Created',
+        `A new order has been created for ${orderData.customer_name}`,
+        'order',
+        order.id
+      );
+    }
+
     res.status(201).json({
       message: 'Order created successfully',
       order,
@@ -181,6 +238,13 @@ router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
       });
     }
 
+    // Get the old order to compare status changes
+    const { data: oldOrder } = await supabaseAdmin
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .single();
+
     const { data: order, error } = await supabaseAdmin
       .from('orders')
       .update(updateData)
@@ -197,6 +261,34 @@ router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
         error: 'Failed to update order',
         details: error.message 
       });
+    }
+
+    // Create notification for admins when order status changes
+    if (order && oldOrder && updateData.status && oldOrder.status !== updateData.status) {
+      const statusMessages: Record<string, string> = {
+        'incoming': 'Order is now incoming',
+        'pending': 'Order moved to pending',
+        'accepted': 'Order has been accepted',
+        'declined': 'Order has been declined',
+        'completed': 'Order has been completed',
+      };
+
+      const statusMessage = statusMessages[updateData.status] || `Order status changed to ${updateData.status}`;
+      
+      await createNotificationForAdmins(
+        `Order Status Updated: ${updateData.status.toUpperCase()}`,
+        `Order for ${order.customer_name} - ${statusMessage}`,
+        updateData.status === 'completed' ? 'success' : updateData.status === 'declined' ? 'warning' : 'order',
+        order.id
+      );
+    } else if (order && !updateData.status) {
+      // Other field updates (not status)
+      await createNotificationForAdmins(
+        'Order Updated',
+        `Order for ${order.customer_name} has been updated`,
+        'info',
+        order.id
+      );
     }
 
     res.json({
