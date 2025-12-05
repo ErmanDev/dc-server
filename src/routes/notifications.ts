@@ -226,5 +226,91 @@ router.post('/', authenticate, async (req: AuthenticatedRequest, res: Response) 
   }
 });
 
+/**
+ * POST /api/notifications/notify-admin-ready
+ * Notify all admins that an order is ready for pickup (viewers can call this)
+ */
+router.post('/notify-admin-ready', authenticate, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    const { order_id } = req.body;
+
+    if (!order_id) {
+      return res.status(400).json({ error: 'order_id is required' });
+    }
+
+    // Use admin client to bypass RLS
+    if (!supabaseAdmin) {
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        details: 'Service role key not configured'
+      });
+    }
+
+    // Get order details for the notification message
+    const { data: order, error: orderError } = await supabaseAdmin
+      .from('orders')
+      .select('id, customer_name, order_details')
+      .eq('id', order_id)
+      .single();
+
+    if (orderError || !order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Get all admin users
+    const { data: adminUsers, error: adminError } = await supabaseAdmin
+      .from('user_profiles')
+      .select('id')
+      .eq('role', 'admin');
+
+    if (adminError) {
+      return res.status(500).json({ 
+        error: 'Failed to fetch admin users',
+        details: adminError.message 
+      });
+    }
+
+    if (!adminUsers || adminUsers.length === 0) {
+      return res.status(404).json({ error: 'No admin users found' });
+    }
+
+    // Create notifications for all admins
+    const notifications = adminUsers.map(admin => ({
+      user_id: admin.id,
+      title: 'Cake Ready for Pickup',
+      message: `Order for ${order.customer_name} is ready for pickup. ${order.order_details ? `Details: ${order.order_details}` : ''}`,
+      type: 'order' as const,
+      order_id: order_id,
+    }));
+
+    const { data: createdNotifications, error: insertError } = await supabaseAdmin
+      .from('notifications')
+      .insert(notifications)
+      .select();
+
+    if (insertError) {
+      return res.status(400).json({ 
+        error: 'Failed to create notifications',
+        details: insertError.message 
+      });
+    }
+
+    res.status(201).json({
+      message: `Notifications sent to ${adminUsers.length} admin(s)`,
+      notifications: createdNotifications,
+      count: createdNotifications?.length || 0,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: 'Failed to notify admins',
+      details: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
+});
+
 export default router;
 
