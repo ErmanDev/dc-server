@@ -41,8 +41,19 @@ router.get('/', authenticate, async (req: AuthenticatedRequest, res: Response) =
 
     if (error) {
       console.error('[GET /notifications] Error fetching notifications:', error);
-      return res.status(400).json({ error: error.message });
+      console.error('[GET /notifications] Error details:', {
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+        code: error.code,
+      });
+      return res.status(400).json({ 
+        error: error.message || 'Failed to fetch notifications',
+        details: error.details || error.hint || 'Unknown error',
+      });
     }
+
+    console.log(`[GET /notifications] Successfully fetched ${notifications?.length || 0} notification(s) for user ${req.user.id}`);
 
     res.json({
       notifications: notifications || [],
