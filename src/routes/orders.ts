@@ -7,12 +7,14 @@ const router = Router();
 
 /**
  * Helper function to create notifications for all admin users
+ * @param excludeUserId - Optional user ID to exclude from notifications (e.g., the user who made the change)
  */
 async function createNotificationForAdmins(
   title: string,
   message: string,
   type: 'info' | 'success' | 'warning' | 'error' | 'order' = 'order',
-  orderId?: string
+  orderId?: string,
+  excludeUserId?: string
 ): Promise<void> {
   if (!supabaseAdmin) {
     console.warn('Cannot create notifications: Service role key not configured');
@@ -31,8 +33,18 @@ async function createNotificationForAdmins(
       return;
     }
 
-    // Create notifications for all admins
-    const notifications = admins.map(admin => ({
+    // Filter out the excluded user if provided
+    const adminsToNotify = excludeUserId 
+      ? admins.filter(admin => admin.id !== excludeUserId)
+      : admins;
+
+    if (adminsToNotify.length === 0) {
+      console.log('No admins to notify after filtering');
+      return;
+    }
+
+    // Create notifications for all admins (except excluded user)
+    const notifications = adminsToNotify.map(admin => ({
       user_id: admin.id,
       title,
       message,
@@ -46,6 +58,8 @@ async function createNotificationForAdmins(
 
     if (notificationError) {
       console.error('Failed to create notifications:', notificationError);
+    } else {
+      console.log(`Successfully created ${notifications.length} notification(s) for admin(s)`);
     }
   } catch (error) {
     console.error('Error creating notifications for admins:', error);
@@ -165,15 +179,7 @@ router.post('/', authenticate, requireAdmin, async (req: AuthenticatedRequest, r
       return res.status(400).json({ error: error.message });
     }
 
-    // Create notification for admins (excluding the creator if they're an admin)
-    if (order) {
-      await createNotificationForAdmins(
-        'New Order Created',
-        `A new order has been created for ${orderData.customer_name}`,
-        'order',
-        order.id
-      );
-    }
+    // No notification for new order creation - admins will see it in the incoming column
 
     res.status(201).json({
       message: 'Order created successfully',
@@ -190,8 +196,8 @@ router.post('/', authenticate, requireAdmin, async (req: AuthenticatedRequest, r
 /**
  * PUT /api/orders/:id
  * Update an order (requires authentication)
- * - Viewers can only update status field
- * - Admins can update all fields
+ * - Viewers can update all fields except completed_at
+ * - Admins can update all fields including completed_at
  */
 router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -204,24 +210,19 @@ router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
 
     const updateData: OrderUpdate = {};
     
-    // Admins can update all fields
-    if (isAdmin) {
-      if (req.body.customer_name !== undefined) updateData.customer_name = req.body.customer_name;
-      if (req.body.order_details !== undefined) updateData.order_details = req.body.order_details;
-      if (req.body.location !== undefined) updateData.location = req.body.location;
-      if (req.body.phone_number !== undefined) updateData.phone_number = req.body.phone_number;
-      if (req.body.pickup_date !== undefined) updateData.pickup_date = req.body.pickup_date;
-      if (req.body.meta_business_link !== undefined) updateData.meta_business_link = req.body.meta_business_link;
-      if (req.body.image !== undefined) updateData.image = req.body.image;
-      if (req.body.status !== undefined) updateData.status = req.body.status;
-      if (req.body.completed_at !== undefined) updateData.completed_at = req.body.completed_at;
-    } else {
-      // Viewers can only update status
-      if (req.body.status !== undefined) {
-        updateData.status = req.body.status;
-      } else {
-        return res.status(403).json({ error: 'Viewers can only update order status' });
-      }
+    // Both admins and viewers can update all fields
+    if (req.body.customer_name !== undefined) updateData.customer_name = req.body.customer_name;
+    if (req.body.order_details !== undefined) updateData.order_details = req.body.order_details;
+    if (req.body.location !== undefined) updateData.location = req.body.location;
+    if (req.body.phone_number !== undefined) updateData.phone_number = req.body.phone_number;
+    if (req.body.pickup_date !== undefined) updateData.pickup_date = req.body.pickup_date;
+    if (req.body.meta_business_link !== undefined) updateData.meta_business_link = req.body.meta_business_link;
+    if (req.body.image !== undefined) updateData.image = req.body.image;
+    if (req.body.status !== undefined) updateData.status = req.body.status;
+    
+    // Only admins can update completed_at
+    if (isAdmin && req.body.completed_at !== undefined) {
+      updateData.completed_at = req.body.completed_at;
     }
 
     if (Object.keys(updateData).length === 0) {
@@ -239,11 +240,15 @@ router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
     }
 
     // Get the old order to compare status changes
-    const { data: oldOrder } = await supabaseAdmin
+    const { data: oldOrder, error: oldOrderError } = await supabaseAdmin
       .from('orders')
       .select('*')
       .eq('id', id)
       .single();
+
+    if (oldOrderError && oldOrderError.code !== 'PGRST116') {
+      console.error('Error fetching old order:', oldOrderError);
+    }
 
     const { data: order, error } = await supabaseAdmin
       .from('orders')
@@ -263,32 +268,57 @@ router.put('/:id', authenticate, async (req: AuthenticatedRequest, res: Response
       });
     }
 
-    // Create notification for admins when order status changes
-    if (order && oldOrder && updateData.status && oldOrder.status !== updateData.status) {
-      const statusMessages: Record<string, string> = {
-        'incoming': 'Order is now incoming',
-        'pending': 'Order moved to pending',
-        'accepted': 'Order has been accepted',
-        'declined': 'Order has been declined',
-        'completed': 'Order has been completed',
-      };
-
-      const statusMessage = statusMessages[updateData.status] || `Order status changed to ${updateData.status}`;
+    // Create notification for admins when order status changes (card moves)
+    // Always create notification if status is being updated, regardless of old status
+    if (order && updateData.status) {
+      const oldStatus = oldOrder?.status;
+      const newStatus = updateData.status;
       
-      await createNotificationForAdmins(
-        `Order Status Updated: ${updateData.status.toUpperCase()}`,
-        `Order for ${order.customer_name} - ${statusMessage}`,
-        updateData.status === 'completed' ? 'success' : updateData.status === 'declined' ? 'warning' : 'order',
-        order.id
-      );
+      // Only create notification if status actually changed
+      if (oldStatus !== newStatus) {
+        console.log(`[NOTIFICATION] Order ${order.id} status changed from ${oldStatus} to ${newStatus}`);
+        
+        const statusMessages: Record<string, string> = {
+          'incoming': 'Order moved to incoming',
+          'pending': 'Order moved to pending',
+          'accepted': 'Order moved to accepted',
+          'declined': 'Order moved to declined',
+          'completed': 'Order moved to completed',
+        };
+
+        const statusMessage = statusMessages[newStatus] || `Order status changed to ${newStatus}`;
+        
+        // Get the user who made the change for logging
+        const userId = req.user?.id;
+        const userName = req.user?.username || 'Unknown';
+        
+        console.log(`[NOTIFICATION] Creating notification for order ${order.id}, moved by user ${userId} (${userName})`);
+        
+        // Create notifications for ALL admins (including the one who made the change)
+        // This ensures all admins can see all activity for better tracking
+        await createNotificationForAdmins(
+          `Order Moved: ${newStatus.toUpperCase()}`,
+          `Order for ${order.customer_name} - ${statusMessage}. ${order.order_details ? `Details: ${order.order_details}` : ''}`,
+          newStatus === 'completed' ? 'success' : newStatus === 'declined' ? 'warning' : 'order',
+          order.id
+          // Don't exclude anyone - all admins should see all moves
+        );
+      } else {
+        console.log(`[NOTIFICATION] Order ${order.id} status unchanged (${oldStatus}), skipping notification`);
+      }
     } else if (order && !updateData.status) {
-      // Other field updates (not status)
-      await createNotificationForAdmins(
-        'Order Updated',
-        `Order for ${order.customer_name} has been updated`,
-        'info',
-        order.id
-      );
+      // Other field updates (not status) - only notify if admin made the change
+      // Viewers shouldn't trigger notifications for non-status updates
+      if (isAdmin) {
+        console.log(`[NOTIFICATION] Creating notification for order ${order.id} field update (non-status)`);
+        await createNotificationForAdmins(
+          'Order Updated',
+          `Order for ${order.customer_name} has been updated`,
+          'info',
+          order.id
+          // Don't exclude - all admins should see updates
+        );
+      }
     }
 
     res.json({
